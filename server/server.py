@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import pickle
+import os
 from database.postgres import PostgresManager
 from database.persistence import PersistenceManager
 from shared.utils import setup_logger, get_timestamp
-from shared.models import ServerInfo, AuditEvent
+from shared.models import ServerInfo, AuditEvent, User, Message
 from shared.protocol import receive_packet, send_packet, PacketType
 
 class Server:
@@ -24,9 +26,30 @@ class Server:
         # Networking state
         self.tasks = {}
         self.connected_followers = {}  # server_id -> {reader, writer, host, port}
+        self.connected_clients = {}    # username -> {reader, writer}
         self.leader_reader = None
         self.leader_writer = None
         self.tcp_server = None
+        self.chat_history = []
+        self.history_file = "history/chat_history.pkl"
+
+    def _load_chat_history(self):
+        if self.is_leader and os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'rb') as f:
+                    self.chat_history = pickle.load(f)
+                self.logger.info(f"Loaded {len(self.chat_history)} messages from history.")
+            except Exception as e:
+                self.logger.error(f"Failed to load chat history: {e}")
+
+    def _save_chat_history(self):
+        if self.is_leader:
+            try:
+                os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+                with open(self.history_file, 'wb') as f:
+                    pickle.dump(self.chat_history, f)
+            except Exception as e:
+                self.logger.error(f"Failed to save chat history: {e}")
 
     async def start(self):
         self.logger.info(f"Starting {self.__class__.__name__} with ID {self.server_id} (Leader: {self.is_leader})")
@@ -47,6 +70,7 @@ class Server:
         await self._log_audit(f"{'Leader' if self.is_leader else 'Follower'} Started")
 
         if self.is_leader:
+            self._load_chat_history()
             await self._start_leader_mode()
         else:
             await self._start_follower_mode()
@@ -142,38 +166,27 @@ class Server:
         self.logger.info(f"New connection from {addr}")
 
         try:
-            while True:
-                packet = await receive_packet(reader)
-                if packet is None:
-                    break
+            packet = await receive_packet(reader)
+            if packet is None:
+                return
 
-                packet_type, payload = packet
-                if packet_type == PacketType.SERVER_JOIN:
-                    await self._handle_server_join(reader, writer, payload)
-                else:
-                    self.logger.warning(f"Received unexpected packet type {packet_type} from {addr}")
-
-        except Exception as e:
-            self.logger.error(f"Error handling connection from {addr}: {e}")
-        finally:
-            # Check if this was a registered follower
-            follower_id = None
-            for fid, info in self.connected_followers.items():
-                if info["writer"] == writer:
-                    follower_id = fid
-                    break
-
-            if follower_id:
-                del self.connected_followers[follower_id]
-                self.logger.info(f"Follower {follower_id} disconnected.")
-                await self._log_audit("Follower Disconnected", f"Follower {follower_id} disconnected")
+            packet_type, payload = packet
+            if packet_type == PacketType.SERVER_JOIN:
+                await self._handle_follower_connection(reader, writer, payload)
+            elif packet_type == PacketType.LOGIN:
+                await self._handle_login(reader, writer, payload)
+            elif packet_type == PacketType.REGISTER:
+                await self._handle_register(reader, writer, payload)
             else:
-                self.logger.info(f"Connection from {addr} closed.")
-
+                self.logger.warning(f"Received unexpected initial packet type {packet_type} from {addr}")
+                writer.close()
+                await writer.wait_closed()
+        except Exception as e:
+            self.logger.error(f"Error identifying connection from {addr}: {e}")
             writer.close()
             await writer.wait_closed()
 
-    async def _handle_server_join(self, reader, writer, payload):
+    async def _handle_follower_connection(self, reader, writer, payload):
         follower_id = payload.get("server_id")
         host = payload.get("host")
         port = payload.get("port")
@@ -186,6 +199,134 @@ class Server:
             "port": port
         }
         await self._log_audit("Follower Joined", f"Server {follower_id} joined from {host}:{port}")
+
+        try:
+            while True:
+                packet = await receive_packet(reader)
+                if packet is None:
+                    break
+                # Process Follower packets (Phase 4+)
+        except Exception as e:
+            self.logger.error(f"Error in follower {follower_id} connection: {e}")
+        finally:
+            if follower_id in self.connected_followers:
+                del self.connected_followers[follower_id]
+            self.logger.info(f"Follower {follower_id} disconnected.")
+            await self._log_audit("Follower Disconnected", f"Follower {follower_id} disconnected")
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle_client_connection(self, reader, writer, username):
+        self.connected_clients[username] = {
+            "reader": reader,
+            "writer": writer
+        }
+        self.logger.info(f"User {username} joined chat.")
+        await self._log_audit("User joined chat", f"User: {username}")
+
+        # Restore history
+        await self._send_history(writer)
+        self.logger.info(f"History restored for {username}")
+
+        try:
+            while True:
+                packet = await receive_packet(reader)
+                if packet is None:
+                    break
+
+                packet_type, payload = packet
+                if packet_type == PacketType.MESSAGE:
+                    await self._handle_message(username, payload)
+                else:
+                    self.logger.warning(f"Unexpected packet {packet_type} from client {username}")
+        except Exception as e:
+            self.logger.error(f"Error in client {username} connection: {e}")
+        finally:
+            if username in self.connected_clients:
+                del self.connected_clients[username]
+            self.logger.info(f"User {username} disconnected.")
+            await self._log_audit("User disconnected", f"User: {username}")
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle_login(self, reader, writer, payload):
+        username = payload.get("username")
+        password = payload.get("password")
+
+        user_row = await self.persistence.get_user_by_username(username)
+        if user_row and user_row['password'] == password:
+            self.logger.info(f"User login success: {username}")
+            await self._log_audit("User login success", f"User: {username}")
+            await send_packet(writer, PacketType.LOGIN_RESPONSE, {"success": True, "message": "Login successful"})
+            await self._handle_client_connection(reader, writer, username)
+        else:
+            self.logger.warning(f"User login failed: {username}")
+            await self._log_audit("User login failed", f"User: {username}")
+            await send_packet(writer, PacketType.LOGIN_RESPONSE, {"success": False, "message": "Invalid credentials"})
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle_register(self, reader, writer, payload):
+        username = payload.get("username")
+        password = payload.get("password")
+
+        existing_user = await self.persistence.get_user_by_username(username)
+        if existing_user:
+            self.logger.warning(f"Registration failed: Username {username} already exists.")
+            await send_packet(writer, PacketType.REGISTER_RESPONSE, {"success": False, "message": "Username already exists"})
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        try:
+            user = User(username=username, password=password)
+            await self.persistence.create_user(user)
+            self.logger.info(f"User registered: {username}")
+            await self._log_audit("User registered", f"User: {username}")
+            await send_packet(writer, PacketType.REGISTER_RESPONSE, {"success": True, "message": "Registration successful"})
+            # After registration, we don't automatically log in. Requirements say "Client sends: REGISTER -> Leader returns success/failure"
+            # And then the client can login.
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            self.logger.error(f"Error during registration for {username}: {e}")
+            await send_packet(writer, PacketType.REGISTER_RESPONSE, {"success": False, "message": "Registration failed due to server error"})
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle_message(self, username, payload):
+        content = payload.get("message")
+        msg = Message(username=username, message=content)
+
+        # Store message
+        self.chat_history.append(msg)
+        self._save_chat_history()
+
+        self.logger.info(f"Message broadcast from {username}")
+
+        # Broadcast
+        await self._broadcast_message(msg)
+
+    async def _broadcast_message(self, msg: Message):
+        payload = msg.to_dict()
+        disconnected_clients = []
+
+        for username, info in self.connected_clients.items():
+            try:
+                await send_packet(info["writer"], PacketType.MESSAGE, payload)
+            except Exception as e:
+                self.logger.error(f"Failed to send message to {username}: {e}")
+                disconnected_clients.append(username)
+
+        for username in disconnected_clients:
+            if username in self.connected_clients:
+                del self.connected_clients[username]
+
+    async def _send_history(self, writer):
+        history_payload = {
+            "messages": [msg.to_dict() for msg in self.chat_history]
+        }
+        await send_packet(writer, PacketType.HISTORY, history_payload)
 
     async def stop(self):
         self.logger.info(f"Shutting down server {self.server_id}")

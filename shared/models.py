@@ -4,10 +4,24 @@ from typing import Optional
 
 @dataclass
 class Message:
-    sender: str
-    content: str
+    username: str
+    message: str
     timestamp: datetime = field(default_factory=datetime.now)
-    message_id: Optional[int] = None
+
+    def to_dict(self):
+        return {
+            "username": self.username,
+            "message": self.message,
+            "timestamp": self.timestamp.isoformat()
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            username=data["username"],
+            message=data["message"],
+            timestamp=datetime.fromisoformat(data["timestamp"])
+        )
 
 @dataclass
 class User:
