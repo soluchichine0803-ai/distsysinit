@@ -1,0 +1,10 @@
+2026-07-07 20:40:40,500 - Leader - INFO - Starting Server with ID 1 (Leader: True)
+2026-07-07 20:40:40,508 - Database - ERROR - Failed to connect to PostgreSQL: Multiple exceptions: [Errno 111] Connect call failed ('::1', 5432, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 5432)
+2026-07-07 20:40:40,508 - Leader - WARNING - Database connection failed: Multiple exceptions: [Errno 111] Connect call failed ('::1', 5432, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 5432). Continuing in degraded mode.
+2026-07-07 20:40:40,508 - Leader - WARNING - Failed to register in DB: 'NoneType' object has no attribute 'acquire'
+2026-07-07 20:40:40,508 - Leader - INFO - Leader listening on 0.0.0.0:8000
+2026-07-07 20:40:42,510 - Leader - INFO - New connection from ('127.0.0.1', 53956)
+2026-07-07 20:40:42,511 - Leader - INFO - SERVER_JOIN received from Server 2.
+2026-07-07 20:40:43,577 - Leader - INFO - New connection from ('127.0.0.1', 53964)
+2026-07-07 20:40:43,577 - Leader - INFO - SERVER_JOIN received from Server 3.
+2026-07-07 20:40:46,138 - Leader - INFO - Follower 2 disconnected.

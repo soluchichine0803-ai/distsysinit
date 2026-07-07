@@ -1,5 +1,6 @@
 import json
 import struct
+import asyncio
 from enum import Enum, auto
 
 class PacketType(Enum):
@@ -46,3 +47,38 @@ def parse_packet(data: bytes) -> tuple[int, dict | None]:
     json_str = json_bytes.decode('utf-8')
     packet_dict = json.loads(json_str)
     return 4 + length, packet_dict
+
+async def send_packet(writer: asyncio.StreamWriter, packet_type: PacketType, payload: dict):
+    """
+    Sends a packet through the writer.
+    """
+    packet = create_packet(packet_type, payload)
+    writer.write(packet)
+    await writer.drain()
+
+async def read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
+    """
+    Reads exactly n bytes from the reader.
+    """
+    data = b''
+    while len(data) < n:
+        chunk = await reader.read(n - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading")
+        data += chunk
+    return data
+
+async def receive_packet(reader: asyncio.StreamReader) -> tuple[PacketType, dict] | None:
+    """
+    Receives a packet from the reader.
+    """
+    try:
+        header = await read_exactly(reader, 4)
+        length = struct.unpack('>I', header)[0]
+        payload_data = await read_exactly(reader, length)
+        packet_dict = json.loads(payload_data.decode('utf-8'))
+        return PacketType(packet_dict["type"]), packet_dict["payload"]
+    except (ConnectionError, asyncio.IncompleteReadError):
+        return None
+    except Exception:
+        return None
