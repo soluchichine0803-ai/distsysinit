@@ -17,7 +17,9 @@ class ChatClient:
         self.port = 8000
         self.config_file = ".client_config"
         self.username = None
+        self.password = None # Store in memory for auto-reconnect
         self.ui = None
+        self.reconnecting = False
         self.load_config()
 
     def load_config(self):
@@ -89,6 +91,7 @@ class ChatClient:
         if response and response[0] == PacketType.LOGIN_RESPONSE:
             if response[1]["success"]:
                 self.username = username
+                self.password = password
                 return True, response[1]["message"]
             else:
                 await self.disconnect()
@@ -100,6 +103,30 @@ class ChatClient:
     async def send_message(self, message):
         if self.writer:
             await send_packet(self.writer, PacketType.MESSAGE, {"message": message})
+
+    async def _reconnect_loop(self):
+        if self.reconnecting:
+            return
+        self.reconnecting = True
+
+        while self.ui.in_chat:
+            self.logger.info("Attempting to reconnect...")
+            if await self.connect():
+                # Re-authenticate
+                await send_packet(self.writer, PacketType.LOGIN, {"username": self.username, "password": self.password})
+                response = await receive_packet(self.reader)
+                if response and response[0] == PacketType.LOGIN_RESPONSE and response[1]["success"]:
+                    self.logger.info("Reconnected and re-authenticated successfully.")
+                    await self.ui.display_system_message("Reconnected to server.")
+                    self.reconnecting = False
+                    asyncio.create_task(self.listen_for_packets())
+                    return
+                else:
+                    await self.disconnect()
+
+            await asyncio.sleep(2)
+
+        self.reconnecting = False
 
     async def listen_for_packets(self):
         try:
@@ -126,8 +153,10 @@ class ChatClient:
         finally:
             self.logger.info("Stopped listening for packets.")
             if self.ui.in_chat:
-                await self.ui.display_system_message("Disconnected from server.")
-                self.ui.in_chat = False
+                self.writer = None
+                self.reader = None
+                await self.ui.display_system_message("Disconnected from server. Reconnecting...")
+                asyncio.create_task(self._reconnect_loop())
 
 async def main():
     client = ChatClient()
