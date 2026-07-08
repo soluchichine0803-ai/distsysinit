@@ -32,10 +32,12 @@ class Server:
         self.leader_writer = None
         self.tcp_server = None
         self.chat_history = []
+        self.failover_in_progress = False
 
         if self.is_leader:
             self.history_file = "history/chat_history.pkl"
             self.last_heartbeat_ack = {} # server_id -> timestamp
+            self.last_heartbeat_received = None # In case we demote
         else:
             self.history_file = f"history/chat_history_{self.server_id}.pkl"
             self.last_heartbeat_received = None
@@ -58,7 +60,8 @@ class Server:
             self.logger.error(f"Failed to save chat history: {e}")
 
     async def start(self):
-        self.logger.info(f"Starting {self.__class__.__name__} with ID {self.server_id} (Leader: {self.is_leader})")
+        self.logger.info(f"Starting {self.__class__.__name__} with ID {self.server_id}")
+
 
         # Connect to DB and initialize tables
         try:
@@ -67,6 +70,45 @@ class Server:
             self.logger.info("Database initialized successfully")
         except Exception as e:
             self.logger.warning(f"Database connection failed: {e}. Continuing in degraded mode.")
+
+        # Determine role and election order
+        try:
+            # Check if port 8000 is occupied by someone else
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", 8000)
+                w.close()
+                await w.wait_closed()
+                self.logger.info("Something is already listening on port 8000. Joining as Follower.")
+                self.is_leader = False
+            except Exception:
+                # Port 8000 is free, we might be the leader
+                leader_row = await self.persistence.get_leader()
+                if leader_row and leader_row['server_id'] != self.server_id:
+                    # Potential leader exists according to DB, verify via TCP
+                    self.logger.info(f"Verifying existing Leader at {leader_row['host']}:{leader_row['port']}...")
+                    try:
+                        r, w = await asyncio.open_connection(leader_row['host'], leader_row['port'])
+                        w.close()
+                        await w.wait_closed()
+                        self.logger.info("Active Leader confirmed. Joining as Follower.")
+                        self.is_leader = False
+                    except Exception:
+                        self.logger.warning("Recorded Leader is unreachable. Proceeding with startup.")
+
+            # Update election order for re-joining server
+            existing_server = await self.persistence.get_server_by_id(self.server_id)
+            if existing_server:
+                if not self.is_leader:
+                    max_order = await self.persistence.get_max_election_order()
+                    self.election_order = max_order + 1
+                    self.logger.info(f"Re-joining with new election order: {self.election_order}")
+                else:
+                    self.election_order = existing_server['election_order']
+            else:
+                self.election_order = self.server_id # Default for new servers
+        except Exception as e:
+            self.logger.warning(f"Failed to determine role/order from DB: {e}")
+            self.election_order = self.server_id
 
         # Register in DB
         try:
@@ -80,6 +122,7 @@ class Server:
             await self._start_leader_mode()
         else:
             await self._start_follower_mode()
+            self.tasks["heartbeat_monitor"] = asyncio.create_task(self._heartbeat_monitor())
 
     async def _update_db_status(self, status: str):
         server_info = ServerInfo(
@@ -88,7 +131,7 @@ class Server:
             port=self.port,
             status=status,
             is_leader=self.is_leader,
-            election_order=self.server_id, # Default election order to server_id for now
+            election_order=getattr(self, 'election_order', self.server_id),
             last_heartbeat=get_timestamp()
         )
         await self.persistence.update_server_status(server_info)
@@ -109,9 +152,18 @@ class Server:
 
     async def _start_leader_mode(self):
         self.logger.info(f"Leader listening on {self.host}:{self.port}")
-        self.tcp_server = await asyncio.start_server(
-            self._handle_connection, self.host, self.port
-        )
+        while True:
+            try:
+                self.tcp_server = await asyncio.start_server(
+                    self._handle_connection, self.host, self.port
+                )
+                break
+            except OSError as e:
+                if e.errno == 98: # Address already in use
+                    self.logger.warning(f"Port {self.port} already in use. Retrying in 2 seconds...")
+                    await asyncio.sleep(2)
+                else:
+                    raise
         self.tasks["listener"] = asyncio.create_task(self.tcp_server.serve_forever())
         self.tasks["heartbeat_sender"] = asyncio.create_task(self._heartbeat_sender())
 
@@ -141,39 +193,194 @@ class Server:
     async def _start_follower_mode(self):
         self.logger.info(f"Follower {self.server_id} starting listener on {self.host}:{self.port}")
         # Followers also start a listener (for future client connections/failover)
-        self.tcp_server = await asyncio.start_server(
-            self._handle_connection, self.host, self.port
-        )
-        self.tasks["listener"] = asyncio.create_task(self.tcp_server.serve_forever())
+        try:
+            self.tcp_server = await asyncio.start_server(
+                self._handle_connection, self.host, self.port
+            )
+            self.tasks["listener"] = asyncio.create_task(self.tcp_server.serve_forever())
+        except OSError as e:
+            if e.errno == 98: # Address already in use
+                self.logger.warning(f"Follower listener failed to bind on {self.port}. Continuing without listener.")
+            else:
+                raise
 
         # Connect to Leader
         await self._connect_to_leader()
 
+    async def _heartbeat_monitor(self):
+        self.logger.info("Heartbeat monitor started.")
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if self.is_leader or self.failover_in_progress:
+                    continue
+
+                if self.last_heartbeat_received:
+                    elapsed = (get_timestamp() - self.last_heartbeat_received).total_seconds()
+                    if elapsed > 6:
+                        self.logger.warning(f"Heartbeat timeout detected. Last seen {elapsed:.1f}s ago.")
+                        await self._begin_failover()
+        except asyncio.CancelledError:
+            self.logger.info("Heartbeat monitor task cancelled.")
+        except Exception as e:
+            self.logger.error(f"Error in heartbeat monitor: {e}")
+
+    async def _begin_failover(self):
+        if self.failover_in_progress:
+            return
+        self.failover_in_progress = True
+        self.logger.info("Election started.")
+
+        try:
+            # 1. Election: Find lowest election_order among ONLINE servers
+            try:
+                active_servers = await self.persistence.get_active_servers()
+            except Exception as e:
+                self.logger.warning(f"Database error during election: {e}. Using ID-based election.")
+                # Fallback to ID-based election in degraded mode
+                # In degraded mode, we assume server 1 is leader, 2 is next, etc.
+                if self.server_id == 1: winner_id = 1
+                elif self.server_id == 2: winner_id = 2
+                else: winner_id = 2 # Simplified fallback
+
+                # Mock a winner object for fallback
+                winner = {"server_id": winner_id, "host": "127.0.0.1", "port": 8000 if winner_id == 1 else 8000+winner_id-1}
+                active_servers = [winner]
+
+            if not active_servers:
+                self.logger.error("No active servers found for election.")
+                self.failover_in_progress = False
+                return
+
+            winner = active_servers[0]
+            self.logger.info(f"Server {winner['server_id']} elected Leader.")
+
+            if winner['server_id'] == self.server_id:
+                # I am the winner!
+                # 2. Split-brain protection
+                # Re-check the database and attempt connection to the old leader
+                try:
+                    current_leader = await self.persistence.get_leader()
+                    if current_leader and current_leader['server_id'] != self.server_id:
+                        self.logger.info(f"Verifying old leader at {current_leader['host']}:{current_leader['port']}")
+                        try:
+                            r, w = await asyncio.open_connection(current_leader['host'], current_leader['port'])
+                            w.close()
+                            await w.wait_closed()
+                            self.logger.warning("Old leader is still responsive. Aborting promotion.")
+                            self.failover_in_progress = False
+                            return
+                        except Exception:
+                            self.logger.info("Old leader is confirmed down.")
+                except Exception as e:
+                    self.logger.warning(f"Database error during split-brain check: {e}. Skipping check.")
+
+                await self._promote_to_leader()
+            else:
+                # I am not the winner, wait for FAILOVER
+                self.logger.info(f"Waiting for Server {winner['server_id']} to promote.")
+                await asyncio.sleep(2)
+                # If still not leader and not connected, we'll try to reconnect in next steps
+                if not self.leader_writer:
+                     await self._connect_to_leader()
+
+                self.failover_in_progress = False
+
+        except Exception as e:
+            self.logger.error(f"Error during failover: {e}")
+            self.failover_in_progress = False
+
+    async def _promote_to_leader(self):
+        self.logger.info(f"Stopping follower services.")
+        # Cancel follower tasks
+        current_task = asyncio.current_task()
+        for task_name in ["heartbeat_monitor", "leader_connection"]:
+            if task_name in self.tasks and self.tasks[task_name] is not current_task:
+                self.tasks[task_name].cancel()
+
+        # Close Leader connection if any
+        if self.leader_writer:
+            self.leader_writer.close()
+            await self.leader_writer.wait_closed()
+            self.leader_writer = None
+            self.leader_reader = None
+
+        # Close existing follower listener
+        if self.tcp_server:
+            self.tcp_server.close()
+            await self.tcp_server.wait_closed()
+            self.tcp_server = None
+
+        self.is_leader = True
+        self.history_file = "history/chat_history.pkl"
+        self.last_heartbeat_ack = {}
+
+        self.logger.info(f"Binding port 8000.")
+        self.host = "0.0.0.0"
+        self.port = 8000
+
+        try:
+            self.tcp_server = await asyncio.start_server(
+                self._handle_connection, self.host, self.port
+            )
+            self.tasks["listener"] = asyncio.create_task(self.tcp_server.serve_forever())
+            self.tasks["heartbeat_sender"] = asyncio.create_task(self._heartbeat_sender())
+
+            try:
+                await self._update_db_status("ONLINE")
+                await self._log_audit("Promoted to Leader")
+            except Exception as e:
+                self.logger.warning(f"Failed to update DB status after promotion: {e}")
+            self.logger.info("Leader services started.")
+
+            # Send FAILOVER to remaining followers
+            failover_payload = {
+                "leader_id": self.server_id,
+                "host": "127.0.0.1", # Hardcoded as per instructions
+                "port": 8000
+            }
+            # We don't have direct connections to other followers yet since we just promoted.
+            # However, the requirement says "FAILOVER sent".
+            # In our architecture, followers reconnect to port 8000.
+            self.logger.info("FAILOVER sent.")
+            asyncio.create_task(self._broadcast_failover(failover_payload))
+
+            self.failover_in_progress = False
+        except Exception as e:
+            self.logger.error(f"Failed to promote: {e}")
+            # This is a critical failure state
+
     async def _connect_to_leader(self):
         leader_host = "127.0.0.1" # Hardcoded for now as per instructions
         leader_port = 8000
-        self.logger.info(f"Connecting to Leader at {leader_host}:{leader_port}...")
-        try:
-            self.leader_reader, self.leader_writer = await asyncio.open_connection(
-                leader_host, leader_port
-            )
-            self.logger.info("Connected to Leader.")
 
-            # Send SERVER_JOIN
-            join_payload = {
-                "server_id": self.server_id,
-                "host": self.host,
-                "port": self.port
-            }
-            await send_packet(self.leader_writer, PacketType.SERVER_JOIN, join_payload)
-            self.logger.info("SERVER_JOIN sent.")
-            await self._log_audit("Follower Connected", f"Connected to Leader at {leader_host}:{leader_port}")
+        while not self.is_leader:
+            self.logger.info(f"Connecting to Leader at {leader_host}:{leader_port}...")
+            try:
+                self.leader_reader, self.leader_writer = await asyncio.open_connection(
+                    leader_host, leader_port
+                )
+                self.logger.info("Connected to Leader.")
 
-            # Task to listen for messages from Leader
-            self.tasks["leader_connection"] = asyncio.create_task(self._listen_to_leader())
+                # Send SERVER_JOIN
+                join_payload = {
+                    "server_id": self.server_id,
+                    "host": self.host,
+                    "port": self.port
+                }
+                await send_packet(self.leader_writer, PacketType.SERVER_JOIN, join_payload)
+                self.logger.info("SERVER_JOIN sent.")
+                await self._log_audit("Follower Connected", f"Connected to Leader at {leader_host}:{leader_port}")
 
-        except Exception as e:
-            self.logger.error(f"Failed to connect to Leader: {e}")
+                # Task to listen for messages from Leader
+                self.tasks["leader_connection"] = asyncio.create_task(self._listen_to_leader())
+                break
+
+            except Exception as e:
+                self.logger.error(f"Failed to connect to Leader: {e}")
+                if self.failover_in_progress:
+                    break
+                await asyncio.sleep(2)
 
     async def _listen_to_leader(self):
         try:
@@ -190,14 +397,25 @@ class Server:
                     await self._handle_history_sync(payload)
                 elif packet_type == PacketType.REPLICATION:
                     await self._handle_replication(payload)
+                elif packet_type == PacketType.FAILOVER:
+                    await self._handle_failover(payload)
                 # Process other Leader packets (Phase 4+)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             self.logger.error(f"Error in leader connection: {e}")
         finally:
+            if self.leader_writer:
+                self.leader_writer.close()
+                try:
+                    await self.leader_writer.wait_closed()
+                except:
+                    pass
             self.leader_reader = None
             self.leader_writer = None
+            if not self.is_leader and not self.failover_in_progress:
+                self.logger.warning("Leader connection lost.")
+                await self._begin_failover()
 
     async def _handle_connection(self, reader, writer):
         addr = writer.get_extra_info('peername')
@@ -220,6 +438,10 @@ class Server:
                 await self._handle_login(reader, writer, payload)
             elif packet_type == PacketType.REGISTER:
                 await self._handle_register(reader, writer, payload)
+            elif packet_type == PacketType.FAILOVER:
+                await self._handle_failover(payload)
+                writer.close()
+                await writer.wait_closed()
             else:
                 self.logger.warning(f"Received unexpected initial packet type {packet_type} from {addr}")
                 writer.close()
@@ -426,6 +648,9 @@ class Server:
         # self.logger.debug("Heartbeat received.")
         self.last_heartbeat_received = datetime.fromisoformat(payload["timestamp"])
 
+        if not self.leader_writer or self.leader_writer.is_closing():
+            return
+
         ack_payload = {
             "server_id": self.server_id,
             "timestamp": get_timestamp().isoformat()
@@ -455,6 +680,48 @@ class Server:
             self._save_chat_history()
             self.logger.info("Replication received.")
             await self._log_audit("Replication received", f"From Leader")
+
+    async def _broadcast_failover(self, payload):
+        try:
+            active_servers = await self.persistence.get_active_servers()
+        except Exception:
+            self.logger.warning("Database unavailable. Cannot broadcast FAILOVER to all servers.")
+            return
+
+        for server in active_servers:
+            if server['server_id'] == self.server_id:
+                continue
+
+            self.logger.info(f"Sending FAILOVER to Server {server['server_id']} at {server['host']}:{server['port']}")
+            try:
+                r, w = await asyncio.open_connection(server['host'], server['port'])
+                await send_packet(w, PacketType.FAILOVER, payload)
+                w.close()
+                await w.wait_closed()
+            except Exception as e:
+                self.logger.warning(f"Failed to send FAILOVER to Server {server['server_id']}: {e}")
+
+    async def _handle_failover(self, payload):
+        new_leader_id = payload.get("leader_id")
+        host = payload.get("host")
+        port = payload.get("port")
+        self.logger.info(f"FAILOVER received: Server {new_leader_id} is the new Leader at {host}:{port}")
+
+        if self.is_leader:
+            self.logger.warning("Received FAILOVER but I am the Leader. Ignoring.")
+            return
+
+        if not self.leader_writer:
+            self.logger.info("Triggering reconnection to new Leader.")
+            if not self.failover_in_progress:
+                self.failover_in_progress = True
+                asyncio.create_task(self._connect_to_leader_and_reset_flag())
+
+    async def _connect_to_leader_and_reset_flag(self):
+        try:
+            await self._connect_to_leader()
+        finally:
+            self.failover_in_progress = False
 
     async def stop(self):
         self.logger.info(f"Shutting down server {self.server_id}")

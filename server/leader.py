@@ -14,6 +14,10 @@ async def main():
 
     try:
         await leader.start()
+        # If we didn't start as leader (e.g. redirected to follower during start())
+        if not leader.is_leader:
+             # We should keep running but we are already in follower mode tasks
+             pass
         # Keep running until interrupted
         while True:
             await asyncio.sleep(3600)

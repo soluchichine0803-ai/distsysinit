@@ -76,3 +76,20 @@ class PersistenceManager:
     async def add_audit_log(self, event: AuditEvent):
         query = "INSERT INTO AuditLogs (timestamp, server_id, event, details) VALUES ($1, $2, $3, $4)"
         await self.db.execute(query, event.timestamp, event.server_id, event.event, event.details)
+
+    async def get_leader(self):
+        query = "SELECT * FROM Servers WHERE is_leader = TRUE AND status = 'ONLINE' LIMIT 1"
+        return await self.db.fetchrow(query)
+
+    async def get_active_servers(self):
+        query = "SELECT * FROM Servers WHERE status = 'ONLINE' ORDER BY election_order ASC"
+        return await self.db.fetch(query)
+
+    async def get_max_election_order(self):
+        query = "SELECT MAX(election_order) FROM Servers"
+        row = await self.db.fetchrow(query)
+        return row['max'] if row and row['max'] is not None else 0
+
+    async def get_server_by_id(self, server_id: int):
+        query = "SELECT * FROM Servers WHERE server_id = $1"
+        return await self.db.fetchrow(query, server_id)
